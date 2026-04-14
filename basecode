@@ -1,0 +1,425 @@
+#include <Wire.h>
+#include <Arduino.h>
+#include <Adafruit_ICM20948.h>
+#include <Adafruit_Sensor.h>
+#include <ESP32Servo.h>      // Install via Library Manager: "ESP32Servo"
+#include <esp_task_wdt.h>
+
+// ============================================================
+//  CRSF - copy crsf.h from madflight into your sketch folder
+//  https://github.com/qqqlab/madflight/tree/main/src/rcl/crsf
+// ============================================================
+#include "crsf.h"
+
+// ============================================================
+//  PIN DEFINITIONS
+// ============================================================
+// CRSF / ELRS receiver UART2
+#define CRSF_RX_PIN     16   // ELRS Nano TX  --> ESP32 GPIO16
+#define CRSF_TX_PIN     17   // ELRS Nano RX  --> ESP32 GPIO17 (telemetry, optional)
+HardwareSerial crsfSerial(2);
+
+// Servo / ESC output pins
+#define PIN_ESC         5    // Motor ESC (throttle)
+#define PIN_AILERON_L   18   // Left aileron servo
+#define PIN_AILERON_R   19   // Right aileron servo (reversed in mixing)
+#define PIN_ELEVATOR    15   // Elevator servo
+#define PIN_RUDDER      4    // Rudder servo
+
+// Battery monitor
+#define BATTERY_PIN     25
+const float REF_VOLTAGE = 3.3;
+const float R1          = 77600.0;
+const float R2          = 29400.0;
+float battery_voltage   = 10.0;
+
+// Onboard LED
+#define LED_PIN         2
+
+// ============================================================
+//  RC CHANNEL MAPPING  (edit to match your transmitter)
+// ============================================================
+//  CH1 = Roll  (ailerons)
+//  CH2 = Pitch (elevator)
+//  CH3 = Throttle
+//  CH4 = Yaw   (rudder)
+//  CH5 = Arm switch
+//  CH6 = Stabilisation mode switch (>1500 = stabilised, <1500 = manual)
+#define CH_ROLL       0
+#define CH_PITCH      1
+#define CH_THROTTLE   2
+#define CH_YAW        3
+#define CH_ARM        4
+#define CH_STAB_MODE  5
+
+int rcIn[16] = {1500,1500,1000,1500,1000,1000}; // mapped 1000-2000 us
+
+bool isArmed        = false;
+bool stabEnabled    = false;  // true when CH6 > 1500
+bool crsfSignalLost = true;
+unsigned long lastCRSFTime = 0;
+const unsigned long CRSF_TIMEOUT_US = 1000000; // 1 second
+
+// ============================================================
+//  SERVO OBJECTS
+// ============================================================
+Servo escMotor;
+Servo servoAilL;
+Servo servoAilR;
+Servo servoElev;
+Servo servoRudd;
+
+// Servo trim offsets (microseconds) - adjust on bench
+int trimAilL =  0;
+int trimAilR =  0;
+int trimElev =  0;
+int trimRudd =  0;
+
+// ============================================================
+//  IMU - Adafruit ICM-20948
+// ============================================================
+Adafruit_ICM20948 icm;
+
+float RateRoll, RatePitch, RateYaw;
+float AccX, AccY, AccZ;
+float AngleRoll, AnglePitch;
+
+float RateCalRoll = 0, RateCalPitch = 0, RateCalYaw = 0;
+int   RateCalNumber = 0;
+
+float KalmanAngleRoll = 0, KalmanUncRoll = 4.0;
+float KalmanAnglePitch = 0, KalmanUncPitch = 4.0;
+float Kalman1DOutput[2] = {0, 0};
+
+float LoopTimer = 0;
+
+// ============================================================
+//  PID STATE  (one set per axis)
+// ============================================================
+struct PIDState {
+    float prevError = 0;
+    float prevIterm = 0;
+};
+
+PIDState pidRoll, pidPitch, pidYaw;
+
+// ============================================================
+//  PID GAINS  (tune these in flight)
+// ============================================================
+// --- Roll (aileron) ---
+const float P_ROLL  = 0.8;
+const float I_ROLL  = 0.0;
+const float D_ROLL  = 0.05;
+
+// --- Pitch (elevator) ---
+const float P_PITCH = 0.8;
+const float I_PITCH = 0.0;
+const float D_PITCH = 0.05;
+
+// --- Yaw (rudder) ---
+const float P_YAW   = 0.5;
+const float I_YAW   = 0.0;
+const float D_YAW   = 0.0;
+
+// Max PID correction applied to servo output (microseconds)
+const float PID_LIMIT = 300.0;
+
+// ============================================================
+//  KALMAN FILTER
+// ============================================================
+void kalman_1d(float &KalmanState, float &KalmanUnc,
+               float KalmanInput, float KalmanMeasurement) {
+    KalmanState += 0.004f * KalmanInput;
+    KalmanUnc   += 0.004f * 0.004f * 16.0f;                 // process noise
+    float gain   = KalmanUnc / (KalmanUnc + 9.0f);          // measurement noise = 3 deg^2
+    KalmanState += gain * (KalmanMeasurement - KalmanState);
+    KalmanUnc    = (1.0f - gain) * KalmanUnc;
+    Kalman1DOutput[0] = KalmanState;
+    Kalman1DOutput[1] = KalmanUnc;
+}
+
+// ============================================================
+//  PID EQUATION
+// ============================================================
+float pid_equation(float error, float P, float I, float D,
+                   PIDState &state) {
+    float Pterm = P * error;
+    float Iterm = state.prevIterm + I * (error + state.prevError) * 0.004f / 2.0f;
+    Iterm = constrain(Iterm, -PID_LIMIT, PID_LIMIT);
+    float Dterm = D * (error - state.prevError) / 0.004f;
+    float output = constrain(Pterm + Iterm + Dterm, -PID_LIMIT, PID_LIMIT);
+    state.prevError = error;
+    state.prevIterm = Iterm;
+    return output;
+}
+
+void reset_pid() {
+    pidRoll  = {0, 0};
+    pidPitch = {0, 0};
+    pidYaw   = {0, 0};
+}
+
+// ============================================================
+//  IMU READ
+// ============================================================
+void gyro_signals() {
+    sensors_event_t accel, gyro, mag, temp;
+    icm.getEvent(&accel, &gyro, &temp, &mag);
+
+    // Convert rad/s --> deg/s
+    RateRoll  = gyro.gyro.x * (180.0f / M_PI);
+    RatePitch = gyro.gyro.y * (180.0f / M_PI);
+    RateYaw   = gyro.gyro.z * (180.0f / M_PI);
+
+    // Convert m/s^2 --> g
+    AccX = accel.acceleration.x / 9.81f;
+    AccY = accel.acceleration.y / 9.81f;
+    AccZ = accel.acceleration.z / 9.81f;
+
+    // Tilt angles from accelerometer
+    AngleRoll  =  atan2f(AccY, sqrtf(AccX*AccX + AccZ*AccZ)) * (180.0f / M_PI);
+    AnglePitch = -atan2f(AccX, sqrtf(AccY*AccY + AccZ*AccZ)) * (180.0f / M_PI);
+}
+
+// ============================================================
+//  GYRO CALIBRATION
+// ============================================================
+void gyroscope_calibration() {
+    Serial.println("Calibrating gyro - hold plane still...");
+    for (RateCalNumber = 0; RateCalNumber < 2000; RateCalNumber++) {
+        gyro_signals();
+        RateCalRoll  += RateRoll;
+        RateCalPitch += RatePitch;
+        RateCalYaw   += RateYaw;
+        delay(1);
+    }
+    RateCalRoll  /= 2000.0f;
+    RateCalPitch /= 2000.0f;
+    RateCalYaw   /= 2000.0f;
+    Serial.println("Gyro calibration done.");
+}
+
+// ============================================================
+//  CRSF channel helper
+// ============================================================
+int crsfToPWM(int crsfVal) {
+    return map(crsfVal, 172, 1811, 1000, 2000);
+}
+
+// ============================================================
+//  CRSF RECEIVE
+// ============================================================
+void crsfloop() {
+    while (crsfSerial.available()) {
+        uint8_t c = crsfSerial.read();
+        if (crsf_read(c)) {
+            for (int i = 0; i < 16; i++)
+                rcIn[i] = crsfToPWM(rcin_channels[i]);
+            lastCRSFTime = micros();
+            crsfSignalLost = false;
+        }
+    }
+
+    if ((micros() - lastCRSFTime) > CRSF_TIMEOUT_US) {
+        crsfSignalLost = true;
+    }
+
+    if (crsfSignalLost) {
+        // Failsafe: kill throttle, center all surfaces
+        rcIn[CH_THROTTLE]  = 1000;
+        rcIn[CH_ROLL]      = 1500;
+        rcIn[CH_PITCH]     = 1500;
+        rcIn[CH_YAW]       = 1500;
+        rcIn[CH_ARM]       = 1000; // disarm
+        reset_pid();
+    }
+
+    // Arm logic: CH5 > 1500 = armed, throttle must be low to arm
+    if (rcIn[CH_ARM] > 1500 && rcIn[CH_THROTTLE] < 1050) {
+        isArmed = true;
+    }
+    if (rcIn[CH_ARM] < 1500) {
+        isArmed = false;
+    }
+
+    // Stab mode: CH6 > 1500 = stabilised
+    stabEnabled = (rcIn[CH_STAB_MODE] > 1500);
+}
+
+// ============================================================
+//  BATTERY MONITOR TASK
+// ============================================================
+void batteryMonitorTask(void *pvParameters) {
+    while (1) {
+        int raw = analogRead(BATTERY_PIN);
+        float v = (raw / 4095.0f) * REF_VOLTAGE;
+        battery_voltage = v * ((R1 + R2) / R2);
+
+        if (battery_voltage < 9.0f) {
+            Serial.println("WARNING: Battery low!");
+            digitalWrite(LED_PIN, HIGH); vTaskDelay(200 / portTICK_PERIOD_MS);
+            digitalWrite(LED_PIN, LOW);  vTaskDelay(200 / portTICK_PERIOD_MS);
+        } else {
+            digitalWrite(LED_PIN, HIGH);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+    }
+}
+
+// ============================================================
+//  FLIGHT CONTROL TASK
+// ============================================================
+void flightControlTask(void *pvParameters) {
+    while (1) {
+
+        // --- 1. Read IMU ---
+        gyro_signals();
+        RateRoll  -= RateCalRoll;
+        RatePitch -= RateCalPitch;
+        RateYaw   -= RateCalYaw;
+
+        // --- 2. Kalman filter angles ---
+        kalman_1d(KalmanAngleRoll, KalmanUncRoll, RateRoll, AngleRoll);
+        KalmanAngleRoll = Kalman1DOutput[0];
+        KalmanUncRoll   = Kalman1DOutput[1];
+
+        kalman_1d(KalmanAnglePitch, KalmanUncPitch, RatePitch, AnglePitch);
+        KalmanAnglePitch = Kalman1DOutput[0];
+        KalmanUncPitch   = Kalman1DOutput[1];
+
+        // --- 3. Read RC ---
+        crsfloop();
+
+        // --- 4. Compute servo outputs ---
+        int outThrottle = rcIn[CH_THROTTLE];
+        int outAileron  = rcIn[CH_ROLL];      // 1000-2000
+        int outElevator = rcIn[CH_PITCH];
+        int outRudder   = rcIn[CH_YAW];
+
+        if (stabEnabled) {
+            // Desired angle = stick deflection scaled to degrees
+            // Full stick (500us from centre) = ±30° desired angle
+            float desiredRoll  =  0.06f * (rcIn[CH_ROLL]  - 1500); // ±30 deg
+            float desiredPitch =  0.06f * (rcIn[CH_PITCH] - 1500); // ±30 deg
+            float desiredYawRate = 0.15f * (rcIn[CH_YAW]  - 1500); // deg/s
+
+            float errorRoll  = desiredRoll  - KalmanAngleRoll;
+            float errorPitch = desiredPitch - KalmanAnglePitch;
+            float errorYaw   = desiredYawRate - RateYaw; // yaw uses rate, not angle
+
+            float corrRoll  = pid_equation(errorRoll,  P_ROLL,  I_ROLL,  D_ROLL,  pidRoll);
+            float corrPitch = pid_equation(errorPitch, P_PITCH, I_PITCH, D_PITCH, pidPitch);
+            float corrYaw   = pid_equation(errorYaw,   P_YAW,   I_YAW,   D_YAW,   pidYaw);
+
+            // Add PID correction on top of pilot input
+            // corrRoll positive = right roll correction = right ail up, left ail down
+            outAileron  = constrain(rcIn[CH_ROLL]  + (int)corrRoll,  1000, 2000);
+            outElevator = constrain(rcIn[CH_PITCH] + (int)corrPitch, 1000, 2000);
+            outRudder   = constrain(rcIn[CH_YAW]   + (int)corrYaw,   1000, 2000);
+        } else {
+            // Manual mode: pure passthrough, reset PID to avoid windup
+            reset_pid();
+        }
+
+        // --- 5. Safety: disarmed or throttle cut ---
+        if (!isArmed || crsfSignalLost) {
+            outThrottle = 1000;
+            // Keep surfaces at neutral so plane glides if signal lost in air
+            outAileron  = 1500;
+            outElevator = 1500;
+            outRudder   = 1500;
+        }
+
+        // --- 6. Write outputs ---
+        // Throttle
+        escMotor.writeMicroseconds(outThrottle);
+
+        // Left aileron: direct
+        servoAilL.writeMicroseconds(constrain(outAileron  + trimAilL, 1000, 2000));
+
+        // Right aileron: REVERSED (moves opposite to left for correct roll)
+        int outAilR = 3000 - outAileron; // mirror: 1000->2000, 2000->1000
+        servoAilR.writeMicroseconds(constrain(outAilR + trimAilR, 1000, 2000));
+
+        // Elevator and rudder direct
+        servoElev.writeMicroseconds(constrain(outElevator + trimElev, 1000, 2000));
+        servoRudd.writeMicroseconds(constrain(outRudder   + trimRudd, 1000, 2000));
+
+        // --- 7. Debug ---
+        Serial.printf("Roll: %5.1f  Pitch: %5.1f  | Thr: %d  Ail: %d  Elev: %d  Rudd: %d  Stab: %s  Armed: %s\n",
+            KalmanAngleRoll, KalmanAnglePitch,
+            outThrottle, outAileron, outElevator, outRudder,
+            stabEnabled ? "ON" : "OFF",
+            isArmed ? "YES" : "NO");
+
+        // --- 8. Maintain 250Hz loop (4ms) ---
+        while ((micros() - LoopTimer) < 4000);
+        LoopTimer = micros();
+    }
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+    Serial.begin(115200);
+    pinMode(LED_PIN, OUTPUT);
+    analogReadResolution(12);
+    pinMode(BATTERY_PIN, INPUT);
+
+    // I2C + ICM-20948
+    Wire.setClock(400000);
+    Wire.begin();
+    delay(250);
+
+    if (!icm.begin_I2C()) {
+        Serial.println("ICM-20948 not found! Check wiring.");
+        while (1) { digitalWrite(LED_PIN, !digitalRead(LED_PIN)); delay(100); }
+    }
+    icm.setGyroRange(ICM20948_GYRO_RANGE_500_DPS);
+    icm.setAccelRange(ICM20948_ACCEL_RANGE_8_G);
+    icm.setGyroRateDivisor(9); // ~100Hz
+    Serial.println("ICM-20948 ready.");
+
+    // CRSF / ELRS on UART2
+    crsfSerial.begin(420000, SERIAL_8N1, CRSF_RX_PIN, CRSF_TX_PIN);
+    crsf_init();
+    Serial.println("CRSF ready.");
+
+    // Servos and ESC
+    // ESP32Servo requires allocating timers - do this before attaching
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+    ESP32PWM::allocateTimer(2);
+    ESP32PWM::allocateTimer(3);
+
+    escMotor.setPeriodHertz(50);   // Standard 50Hz for ESC
+    servoAilL.setPeriodHertz(50);
+    servoAilR.setPeriodHertz(50);
+    servoElev.setPeriodHertz(50);
+    servoRudd.setPeriodHertz(50);
+
+    escMotor.attach(PIN_ESC,      1000, 2000);
+    servoAilL.attach(PIN_AILERON_L, 1000, 2000);
+    servoAilR.attach(PIN_AILERON_R, 1000, 2000);
+    servoElev.attach(PIN_ELEVATOR,  1000, 2000);
+    servoRudd.attach(PIN_RUDDER,    1000, 2000);
+
+    // Hold servos at neutral and ESC at min while calibrating
+    escMotor.writeMicroseconds(1000);
+    servoAilL.writeMicroseconds(1500);
+    servoAilR.writeMicroseconds(1500);
+    servoElev.writeMicroseconds(1500);
+    servoRudd.writeMicroseconds(1500);
+
+    gyroscope_calibration();
+
+    LoopTimer = micros();
+
+    xTaskCreate(batteryMonitorTask, "Battery",       4096, NULL, 1, NULL);
+    xTaskCreate(flightControlTask,  "FlightControl", 8192, NULL, 2, NULL); // higher priority
+}
+
+void loop() {
+    // Intentionally empty
+}
