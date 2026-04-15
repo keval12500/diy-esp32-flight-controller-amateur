@@ -1,0 +1,155 @@
+#include <Arduino.h>
+#include <ESP32Servo.h>
+
+#define CRSF_BAUD     420000
+#define CRSF_RX_PIN   16
+#define CRSF_TX_PIN   17
+#define ESC_PIN       18
+
+#define CRSF_ADDRESS_FC    0xC8
+#define CRSF_FRAMETYPE_RC  0x16
+#define CRSF_FRAME_SIZE_MAX 64
+
+// Standard ESC pulse range
+#define ESC_MIN_US    1000   // motor off / minimum throttle
+#define ESC_MAX_US    2000   // full throttle
+#define ESC_ARM_US    1000   // pulse sent during arming
+#define ESC_ARM_MS    3000   // how long to hold arm pulse (ms)
+
+HardwareSerial crsfSerial(2);
+Servo esc;
+
+uint8_t buf[CRSF_FRAME_SIZE_MAX];
+uint8_t buf_i = 0, buf_len = 0;
+uint16_t channel[16];
+uint32_t last_frame_ms = 0;
+bool armed = false;
+
+uint8_t crsf_crc8(const uint8_t *ptr, uint8_t len) {
+    static const uint8_t tab[256] = {
+        0x00,0xD5,0x7F,0xAA,0xFE,0x2B,0x81,0x54,0x29,0xFC,0x56,0x83,0xD7,0x02,0xA8,0x7D,
+        0x52,0x87,0x2D,0xF8,0xAC,0x79,0xD3,0x06,0x7B,0xAE,0x04,0xD1,0x85,0x50,0xFA,0x2F,
+        0xA4,0x71,0xDB,0x0E,0x5A,0x8F,0x25,0xF0,0x8D,0x58,0xF2,0x27,0x73,0xA6,0x0C,0xD9,
+        0xF6,0x23,0x89,0x5C,0x08,0xDD,0x77,0xA2,0xDF,0x0A,0xA0,0x75,0x21,0xF4,0x5E,0x8B,
+        0x9D,0x48,0xE2,0x37,0x63,0xB6,0x1C,0xC9,0xB4,0x61,0xCB,0x1E,0x4A,0x9F,0x35,0xE0,
+        0xCF,0x1A,0xB0,0x65,0x31,0xE4,0x4E,0x9B,0xE6,0x33,0x99,0x4C,0x18,0xCD,0x67,0xB2,
+        0x39,0xEC,0x46,0x93,0xC7,0x12,0xB8,0x6D,0x10,0xC5,0x6F,0xBA,0xEE,0x3B,0x91,0x44,
+        0x6B,0xBE,0x14,0xC1,0x95,0x40,0xEA,0x3F,0x42,0x97,0x3D,0xE8,0xBC,0x69,0xC3,0x16,
+        0xEF,0x3A,0x90,0x45,0x11,0xC4,0x6E,0xBB,0xC6,0x13,0xB9,0x6C,0x38,0xED,0x47,0x92,
+        0xBD,0x68,0xC2,0x17,0x43,0x96,0x3C,0xE9,0x94,0x41,0xEB,0x3E,0x6A,0xBF,0x15,0xC0,
+        0x4B,0x9E,0x34,0xE1,0xB5,0x60,0xCA,0x1F,0x62,0xB7,0x1D,0xC8,0x9C,0x49,0xE3,0x36,
+        0x19,0xCC,0x66,0xB3,0xE7,0x32,0x98,0x4D,0x30,0xE5,0x4F,0x9A,0xCE,0x1B,0xB1,0x64,
+        0x72,0xA7,0x0D,0xD8,0x8C,0x59,0xF3,0x26,0x5B,0x8E,0x24,0xF1,0xA5,0x70,0xDA,0x0F,
+        0x20,0xF5,0x5F,0x8A,0xDE,0x0B,0xA1,0x74,0x09,0xDC,0x76,0xA3,0xF7,0x22,0x88,0x5D,
+        0xD6,0x03,0xA9,0x7C,0x28,0xFD,0x57,0x82,0xFF,0x2A,0x80,0x55,0x01,0xD4,0x7E,0xAB,
+        0x84,0x51,0xFB,0x2E,0x7A,0xAF,0x05,0xD0,0xAD,0x78,0xD2,0x07,0x53,0x86,0x2C,0xF9
+    };
+    uint8_t crc = 0;
+    for (uint8_t i = 0; i < len; i++) crc = tab[crc ^ *ptr++];
+    return crc;
+}
+
+uint16_t cv(unsigned v) {
+    static constexpr float scale  = (2012.f - 988.f) / (1811.f - 172.f);
+    static constexpr float offset = 988.f - 172.f * scale;
+    return (uint16_t)(scale * v + offset);
+}
+
+bool parse_byte(uint8_t c) {
+    if (buf_i == 0) {
+        if (c == CRSF_ADDRESS_FC) buf[buf_i++] = c;
+    } else if (buf_i == 1) {
+        if (c >= 2 && c <= (CRSF_FRAME_SIZE_MAX - 2)) { buf[buf_i++] = c; buf_len = c + 2; }
+        else buf_i = 0;
+    } else if (buf_i < buf_len - 1) {
+        buf[buf_i++] = c;
+    } else {
+        buf[buf_i++] = c;
+        uint8_t crc = crsf_crc8(buf + 2, buf[1] - 1);
+        bool ok = (crc == buf[buf_len - 1]);
+        buf_i = 0;
+        if (!ok || buf[2] != CRSF_FRAMETYPE_RC || buf_len != 26) return false;
+        last_frame_ms = millis();
+        channel[0] = cv((buf[3]  | buf[4]  << 8) & 0x7FF);
+        channel[1] = cv((buf[4]  >> 3 | buf[5]  << 5) & 0x7FF);
+        channel[2] = cv((buf[5]  >> 6 | buf[6]  << 2 | buf[7]  << 10) & 0x7FF);
+        channel[3] = cv((buf[7]  >> 1 | buf[8]  << 7) & 0x7FF);
+        channel[4] = cv((buf[8]  >> 4 | buf[9]  << 4) & 0x7FF);
+        channel[5] = cv((buf[9]  >> 7 | buf[10] << 1 | buf[11] << 9) & 0x7FF);
+        channel[6] = cv((buf[11] >> 2 | buf[12] << 6) & 0x7FF);
+        channel[7] = cv((buf[12] >> 5 | buf[13] << 3) & 0x7FF);
+        return true;
+    }
+    return false;
+}
+
+void arm_esc() {
+    Serial.println("Arming ESC... hold throttle low!");
+    esc.writeMicroseconds(ESC_ARM_US);
+    delay(ESC_ARM_MS);
+    Serial.println("ESC Armed! You can now raise throttle.");
+    armed = true;
+}
+
+void setup() {
+    Serial.begin(115200);
+    crsfSerial.begin(CRSF_BAUD, SERIAL_8N1, CRSF_RX_PIN, CRSF_TX_PIN);
+
+    esc.attach(ESC_PIN, ESC_MIN_US, ESC_MAX_US);
+    esc.writeMicroseconds(ESC_MIN_US); // send min immediately on boot
+
+    Serial.println("Waiting for CRSF signal before arming...");
+
+    // Wait until we have a valid CRSF signal AND throttle is low
+    while (true) {
+        while (crsfSerial.available()) parse_byte(crsfSerial.read());
+
+        bool signal_ok = (millis() - last_frame_ms) < 500;
+        bool throttle_low = channel[2] < 1050; // CH3 = throttle
+
+        if (signal_ok && throttle_low) {
+            Serial.println("Signal good, throttle low — proceeding to arm.");
+            break;
+        } else if (signal_ok && !throttle_low) {
+            Serial.println("Signal good but THROTTLE IS NOT LOW — lower throttle stick!");
+        } else {
+            Serial.println("No signal yet...");
+        }
+        delay(500);
+    }
+
+    arm_esc();
+}
+
+uint32_t last_print = 0;
+
+void loop() {
+    bool got_frame = false;
+    while (crsfSerial.available()) {
+        if (parse_byte(crsfSerial.read())) got_frame = true;
+    }
+
+    bool connected = (millis() - last_frame_ms) < 1000;
+
+    if (!connected) {
+        // Failsafe: cut throttle immediately
+        esc.writeMicroseconds(ESC_MIN_US);
+        armed = false;
+    } else if (armed) {
+        // CH3 = throttle, already in ~988-2012 range after cv()
+        uint16_t pulse = constrain(channel[2], ESC_MIN_US, ESC_MAX_US);
+        esc.writeMicroseconds(pulse);
+    }
+
+    // Debug at 10Hz
+    if (millis() - last_print > 100) {
+        last_print = millis();
+        if (!connected) {
+            Serial.println("!! NO SIGNAL -- throttle cut !!");
+        } else {
+            uint16_t pulse = constrain(channel[2], ESC_MIN_US, ESC_MAX_US);
+            Serial.printf("CH3(Thr):%4d  ->  ESC pulse: %d µs  |  Armed: %s\n",
+                channel[2], pulse, armed ? "YES" : "NO");
+        }
+    }
+}
