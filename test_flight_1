@@ -1,0 +1,297 @@
+#include <Arduino.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_ICM20948.h>
+#include <Adafruit_Sensor.h>
+
+// ===== CRSF =====
+#define CRSF_BAUD           420000
+#define CRSF_RX_PIN         16
+#define CRSF_TX_PIN         17
+#define CRSF_ADDRESS_FC     0xC8
+#define CRSF_FRAMETYPE_RC   0x16
+#define CRSF_FRAME_SIZE_MAX 64
+
+// ===== OUTPUT PINS =====
+#define AILERON_L_PIN  25
+#define AILERON_R_PIN  23
+#define ELEVATOR_PIN   13
+#define ESC_PIN        14
+
+// ===== PWM RANGES =====
+#define ESC_MIN_US   1000
+#define ESC_MAX_US   2000
+#define SERVO_MIN_US 500
+#define SERVO_MAX_US 1100
+#define SERVO_MID_US 800
+
+// ===== LOOP TIME =====
+#define LOOP_DT 0.01f   // 10ms loop = 0.01 seconds
+
+// ===== PD GAINS — tune these! =====
+// Start here, increase Kp slowly until it self-levels well,
+// then increase Kd if it oscillates/hunts
+float Kp_roll  = 2.5f;
+float Kd_roll  = 0.5f;
+
+float Kp_pitch = 2.5f;
+float Kd_pitch = 0.5f;
+
+// ===== ANGLE ESTIMATES (degrees) =====
+float roll_angle  = 0;
+float pitch_angle = 0;
+
+// ===== GYRO RATES (deg/s) =====
+float gyro_roll  = 0;
+float gyro_pitch = 0;
+
+// ===== COMPLEMENTARY FILTER WEIGHT =====
+// 0.95 = trust gyro heavily, correct slowly with accel
+// Lower this (e.g. 0.90) if angle drifts badly over time
+#define ALPHA 0.95f
+
+// ===== STABILIZATION =====
+bool stab_on = false;
+
+// ===== IMU =====
+Adafruit_ICM20948 icm;
+sensors_event_t accel_evt, gyro_evt, temp_evt, mag_evt;
+
+// ===== OBJECTS =====
+HardwareSerial crsfSerial(2);
+Servo aileron_l;
+Servo aileron_r;
+Servo elevator;
+Servo esc;
+
+// ===== CRSF GLOBALS =====
+uint8_t  buf[CRSF_FRAME_SIZE_MAX];
+uint8_t  buf_i = 0, buf_len = 0;
+uint16_t channel[16];
+uint32_t last_frame_ms = 0;
+
+// ===== CRC =====
+uint8_t crsf_crc8(const uint8_t *ptr, uint8_t len) {
+    static const uint8_t tab[256] = {
+        0x00,0xD5,0x7F,0xAA,0xFE,0x2B,0x81,0x54,0x29,0xFC,0x56,0x83,0xD7,0x02,0xA8,0x7D,
+        0x52,0x87,0x2D,0xF8,0xAC,0x79,0xD3,0x06,0x7B,0xAE,0x04,0xD1,0x85,0x50,0xFA,0x2F,
+        0xA4,0x71,0xDB,0x0E,0x5A,0x8F,0x25,0xF0,0x8D,0x58,0xF2,0x27,0x73,0xA6,0x0C,0xD9,
+        0xF6,0x23,0x89,0x5C,0x08,0xDD,0x77,0xA2,0xDF,0x0A,0xA0,0x75,0x21,0xF4,0x5E,0x8B,
+        0x9D,0x48,0xE2,0x37,0x63,0xB6,0x1C,0xC9,0xB4,0x61,0xCB,0x1E,0x4A,0x9F,0x35,0xE0,
+        0xCF,0x1A,0xB0,0x65,0x31,0xE4,0x4E,0x9B,0xE6,0x33,0x99,0x4C,0x18,0xCD,0x67,0xB2,
+        0x39,0xEC,0x46,0x93,0xC7,0x12,0xB8,0x6D,0x10,0xC5,0x6F,0xBA,0xEE,0x3B,0x91,0x44,
+        0x6B,0xBE,0x14,0xC1,0x95,0x40,0xEA,0x3F,0x42,0x97,0x3D,0xE8,0xBC,0x69,0xC3,0x16,
+        0xEF,0x3A,0x90,0x45,0x11,0xC4,0x6E,0xBB,0xC6,0x13,0xB9,0x6C,0x38,0xED,0x47,0x92,
+        0xBD,0x68,0xC2,0x17,0x43,0x96,0x3C,0xE9,0x94,0x41,0xEB,0x3E,0x6A,0xBF,0x15,0xC0,
+        0x4B,0x9E,0x34,0xE1,0xB5,0x60,0xCA,0x1F,0x62,0xB7,0x1D,0xC8,0x9C,0x49,0xE3,0x36,
+        0x19,0xCC,0x66,0xB3,0xE7,0x32,0x98,0x4D,0x30,0xE5,0x4F,0x9A,0xCE,0x1B,0xB1,0x64,
+        0x72,0xA7,0x0D,0xD8,0x8C,0x59,0xF3,0x26,0x5B,0x8E,0x24,0xF1,0xA5,0x70,0xDA,0x0F,
+        0x20,0xF5,0x5F,0x8A,0xDE,0x0B,0xA1,0x74,0x09,0xDC,0x76,0xA3,0xF7,0x22,0x88,0x5D,
+        0xD6,0x03,0xA9,0x7C,0x28,0xFD,0x57,0x82,0xFF,0x2A,0x80,0x55,0x01,0xD4,0x7E,0xAB,
+        0x84,0x51,0xFB,0x2E,0x7A,0xAF,0x05,0xD0,0xAD,0x78,0xD2,0x07,0x53,0x86,0x2C,0xF9
+    };
+    uint8_t crc = 0;
+    for (uint8_t i = 0; i < len; i++) crc = tab[crc ^ *ptr++];
+    return crc;
+}
+
+// ===== VALUE CONVERT =====
+uint16_t cv(unsigned v) {
+    static constexpr float scale  = (2012.f - 988.f) / (1811.f - 172.f);
+    static constexpr float offset = 988.f - 172.f * scale;
+    return (uint16_t)(scale * v + offset);
+}
+
+// ===== CRSF PARSER =====
+bool parse_byte(uint8_t c) {
+    if (buf_i == 0) {
+        if (c == CRSF_ADDRESS_FC) buf[buf_i++] = c;
+    } else if (buf_i == 1) {
+        if (c >= 2 && c <= (CRSF_FRAME_SIZE_MAX - 2)) {
+            buf[buf_i++] = c;
+            buf_len = c + 2;
+        } else buf_i = 0;
+    } else if (buf_i < buf_len - 1) {
+        buf[buf_i++] = c;
+    } else {
+        buf[buf_i++] = c;
+        uint8_t crc = crsf_crc8(buf + 2, buf[1] - 1);
+        bool ok = (crc == buf[buf_len - 1]);
+        buf_i = 0;
+
+        if (!ok || buf[2] != CRSF_FRAMETYPE_RC || buf_len != 26) return false;
+
+        last_frame_ms = millis();
+
+        channel[0] = cv((buf[3]       | buf[4]  << 8)         & 0x7FF); // CH1 ailerons
+        channel[1] = cv((buf[4]  >> 3 | buf[5]  << 5)         & 0x7FF); // CH2 elevator
+        channel[2] = cv((buf[5]  >> 6 | buf[6]  << 2
+                                      | buf[7]  << 10)         & 0x7FF); // CH3 throttle
+        channel[3] = cv((buf[7]  >> 1 | buf[8]  << 7)         & 0x7FF); // CH4 unused
+        channel[4] = cv((buf[8]  >> 4 | buf[9]  << 4)         & 0x7FF); // CH5 stab switch
+        channel[5] = cv((buf[9]  >> 7 | buf[10] << 1
+                                      | buf[11] << 9)          & 0x7FF); // CH6 unused
+        channel[6] = cv((buf[11] >> 2 | buf[12] << 6)         & 0x7FF); // CH7 unused
+        channel[7] = cv((buf[12] >> 5 | buf[13] << 3)         & 0x7FF); // CH8 unused
+
+        return true;
+    }
+    return false;
+}
+
+// ===== IMU + COMPLEMENTARY FILTER =====
+// Blends gyro integration (fast, drifts) with accelerometer angle (slow, noisy)
+// Result: accurate angle estimate that doesn't drift and isn't noisy
+void updateIMU() {
+    icm.getEvent(&accel_evt, &gyro_evt, &temp_evt, &mag_evt);
+
+    // Gyro rates in deg/s
+    gyro_roll  = gyro_evt.gyro.x * 57.2958f;
+    gyro_pitch = gyro_evt.gyro.y * 57.2958f;
+
+    // Accelerometer-based angle (degrees)
+    // These are noisy but don't drift
+    float ax = accel_evt.acceleration.x;
+    float ay = accel_evt.acceleration.y;
+    float az = accel_evt.acceleration.z;
+
+    float accel_roll  = atan2f(ay, az) * 57.2958f;
+    float accel_pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.2958f;
+
+    // Complementary filter:
+    // Take 95% gyro integration + 5% accelerometer correction each loop
+    roll_angle  = ALPHA * (roll_angle  + gyro_roll  * LOOP_DT) + (1.0f - ALPHA) * accel_roll;
+    pitch_angle = ALPHA * (pitch_angle + gyro_pitch * LOOP_DT) + (1.0f - ALPHA) * accel_pitch;
+}
+
+// ===== SETUP =====
+void setup() {
+    Serial.begin(115200);
+
+    crsfSerial.begin(CRSF_BAUD, SERIAL_8N1, CRSF_RX_PIN, CRSF_TX_PIN);
+
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+    ESP32PWM::allocateTimer(2);
+    ESP32PWM::allocateTimer(3);
+
+    aileron_l.attach(AILERON_L_PIN, SERVO_MIN_US, SERVO_MAX_US);
+    aileron_r.attach(AILERON_R_PIN, SERVO_MIN_US, SERVO_MAX_US);
+    elevator.attach(ELEVATOR_PIN,   SERVO_MIN_US, SERVO_MAX_US);
+    esc.attach(ESC_PIN,             ESC_MIN_US,   ESC_MAX_US);
+
+    aileron_l.writeMicroseconds(SERVO_MID_US);
+    aileron_r.writeMicroseconds(SERVO_MID_US);
+    elevator.writeMicroseconds(SERVO_MID_US);
+    esc.writeMicroseconds(ESC_MIN_US);
+
+    Wire.begin(21, 22);
+
+    if (!icm.begin_I2C()) {
+        Serial.println("IMU not found! Check wiring.");
+        while (1) delay(100);
+    }
+
+    // Let the complementary filter settle before arming
+    Serial.println("Calibrating IMU — hold still for 2 seconds...");
+    for (int i = 0; i < 200; i++) {
+        updateIMU();
+        delay(10);
+    }
+
+    Serial.println("System Ready");
+    delay(500);
+}
+
+// ===== LOOP =====
+void loop() {
+    uint32_t loop_start = millis();
+
+    // Read CRSF
+    while (crsfSerial.available()) {
+        parse_byte(crsfSerial.read());
+    }
+
+    // Failsafe — no signal for 1 second
+    bool connected = (millis() - last_frame_ms) < 1000;
+    if (!connected) {
+        aileron_l.writeMicroseconds(SERVO_MID_US);
+        aileron_r.writeMicroseconds(SERVO_MID_US);
+        elevator.writeMicroseconds(SERVO_MID_US);
+        esc.writeMicroseconds(ESC_MIN_US);
+        Serial.println("FAILSAFE - no signal");
+        delay(10);
+        return;
+    }
+
+    // Update IMU and angle estimates
+    updateIMU();
+
+    // ------------------------------------------------------------------
+    // CH5 (channel[4]): Stabilization switch
+    // ~988 = OFF  |  ~2012 = ON
+    // ------------------------------------------------------------------
+    stab_on = (channel[4] > 1500);
+
+    // ------------------------------------------------------------------
+    // CH1 (channel[0]): AILERONS
+    // Pilot commands a desired roll angle (-30 to +30 deg)
+    // PD corrects toward that angle
+    // ------------------------------------------------------------------
+    float roll_setpoint = map(channel[0], 988, 2012, -30, 30);  // deg
+
+    float roll_correction = 0;
+    if (stab_on) {
+        float roll_error = roll_setpoint - roll_angle;          // P: how far off level
+        roll_correction  = Kp_roll * roll_error                 // P term
+                         - Kd_roll * gyro_roll;                 // D term: brake fast rotations
+        roll_correction  = constrain(roll_correction, -300, 300);
+    } else {
+        // Stab off: pilot has full direct control, no correction
+        roll_correction = map(channel[0], 988, 2012, -300, 300);
+    }
+
+    int ail_l_out = constrain(SERVO_MID_US + (int)roll_correction, SERVO_MIN_US, SERVO_MAX_US);
+    int ail_r_out = constrain(SERVO_MID_US + (int)roll_correction, SERVO_MIN_US, SERVO_MAX_US);
+
+    aileron_l.writeMicroseconds(ail_l_out);
+    aileron_r.writeMicroseconds(ail_r_out);
+
+    // ------------------------------------------------------------------
+    // CH2 (channel[1]): ELEVATOR
+    // ------------------------------------------------------------------
+    float pitch_setpoint = map(channel[1], 988, 2012, -30, 30); // deg
+
+    float pitch_correction = 0;
+    if (stab_on) {
+        float pitch_error  = pitch_setpoint - pitch_angle;
+        pitch_correction   = Kp_pitch * pitch_error
+                           - Kd_pitch * gyro_pitch;
+        pitch_correction   = constrain(pitch_correction, -300, 300);
+    } else {
+        pitch_correction = map(channel[1], 988, 2012, -300, 300);
+    }
+
+    int elev_out = constrain(SERVO_MID_US + (int)pitch_correction, SERVO_MIN_US, SERVO_MAX_US);
+    elevator.writeMicroseconds(elev_out);
+
+    // ------------------------------------------------------------------
+    // CH3 (channel[2]): THROTTLE
+    // ------------------------------------------------------------------
+    int throttle = constrain(channel[2], ESC_MIN_US, ESC_MAX_US);
+    esc.writeMicroseconds(throttle);
+
+    // ------------------------------------------------------------------
+    // Serial debug
+    // ------------------------------------------------------------------
+    Serial.printf("Stab:%s | RollAngle:%.1f RollSet:%.1f | PitchAngle:%.1f PitchSet:%.1f | AilL:%d AilR:%d Elev:%d Thr:%d | CH5:%d\n",
+                  stab_on ? "ON " : "OFF",
+                  roll_angle, roll_setpoint,
+                  pitch_angle, pitch_setpoint,
+                  ail_l_out, ail_r_out, elev_out, throttle,
+                  channel[4]);
+
+    // Hold loop time steady at 10ms
+    uint32_t elapsed = millis() - loop_start;
+    if (elapsed < 10) delay(10 - elapsed);
+}
